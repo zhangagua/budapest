@@ -1,0 +1,235 @@
+# 说说自己在STL里面踩过的哪些坑儿
+
+tags： c++
+
+---
+
+在开始之前，先贴个大神写的[c++的坑儿](http://coolshell.cn/articles/7992.html),左耳朵耗子。
+
+c++是一什么样的语言很多大神们都谈过了，语言自身作为小菜只能努力，等积攒再足一点才能谈这种话题。c++里面很多东西都要静心研究一次，不然是搞不懂其中的机制的。特别是涉及内存的部分。
+先提出来我自己这一两年来的经验：
+
+1. 拷贝是默认的，引用是指定
+2. 左开右闭 
+
+stl库设计一个重要原则就是左开右闭，比如迭代器的begin和end，然后基本上你觉得有点犹豫它是拷贝还是引用的时候，绝大多数时候都是拷贝。
+容器是我们的用的非常多的工具，但是其实容器的使用没有看起来那么简单，很多时候都要在实践中踩坑儿，有的坑书上写了，看了一遍，记不得，踩了之后就能想起来了。
+
+## 血泪史，把重要的放在前面来，坑啊！
+
+```c++
+int main()
+{       
+    std::vector<Cap> box;
+    box.push_back(Cap(1)); 
+    auto ite = box.begin();
+    while(ite != box.end())
+    {                       
+        std::cout<<"++++++++"<<ite->water()<<"+++++++++"<<std::endl;
+        box.erase(ite++); 
+    } 
+}    
+```
+
+炸了。
+输出结果:
+
+```c++
+destruction cap water : 1
+++++++++1+++++++++
+destruction cap water : 1
+++++++++135137+++++++++
+Segmentation fault (core dumped)
+```
+
+经过试验证明，最后一次的ite-1 == box.end(),也就是说vector跑到了数组的外面。经过思考，考虑到vector的扩容方式是按照2的幂次增长的，__于是我猜测，2^0+1、2^1+1、2^2+1、2^3+1...都要跪。经过试验证明，我是对的。所有的这类数字都会把所有容器删干净，但是再最后一次删除中，ite会越过end()，然后程序蹦掉。__后来我试了7，我发现也是会跪，这事情真的不是太好说清楚。继续看。
+
+再来一段代码：
+
+```c++
+int main()
+{
+    std::vector<Cap> box(4);
+    auto ite = box.begin();
+    while(ite != box.end())
+    {
+        std::cout<<"++++++++"<<ite->water()<<"+++++++++"<<std::endl;
+        box.erase(ite++);
+    }
+    std::cout<<std::endl;
+    std::cout<<std::endl;
+}
+```
+
+输出：
+
+```c++
+construction cap water : 0
+construction cap water : 0
+construction cap water : 0
+construction cap water : 0
+++++++++0+++++++++
+destruction cap water : 0
+++++++++0+++++++++
+destruction cap water : 0
+
+destruction cap water : 0
+destruction cap water : 0
+```
+
+哈哈，居然只删除了__两个元素__，漏掉了2个。
+再试试初始化为32，于是发现只删除了其中__16个__。
+之前就猜测过了vector这个容器肯定在删除的过程中在紧缩自己，也就是begin和end两者很有可能发生了变化，ite在删除之后ite+1指向的区域内容发生了变化。
+鉴于vector的特殊性，我们以后再vector删除的时候，一定只能使用一种方式：
+__ite = box.erase(ite);__
+为了避免其他容器内部未知的内存变化，我__强烈的建议__任何一种容器使用迭代器删除的时候均采用这种方式，并不要去依赖于ite++这种栈。内容都变化了，迭代器指向下一个又如何。
+
+## 可恶的vector出发
+
+先把结论贴在上面
+
+>tips1：对于vector来说resize之后直接可以下标访问，因为每个坑里都有元素了
+tips2：reverse不一样，只是扩了大小，当时坑里还没有东西
+tip3：reverse和resize里面不要填入一个超过2^32的数字，你会跪（我在64位机亲测，4.8.3gcc）
+tip4：如果你想你的程序OOM或者内存爆炸，请在vector或者其他的容器里面直接放对象，否则还是放智能指针吧
+tip5：vector自动扩容规则按照2的幂次增长
+tip6：预先知道容器大小的时候一定要调用带size的构造！自动扩容的代价永远比你想象的大得多！曾经项目中就是改动了一个unordered_map，给了它初始化大小，整个函数时间减少了近3/5（有点忘了，只记得差距效果惊人，容器数据在千万级别）！
+tip7：vector在遍历中访问需要删除时，使用类似ite = box.erase(ite)的形式是最保险的，实践证明网上的box.erase(ite++)方式，依然是可能跪的。
+
+```c++
+#include <iostream>
+#include <vector>
+
+class Cap
+{
+    public:
+        Cap(){ 
+            water_ = 0; 
+            std::cout<<"construction cap water : "<<water_<<std::endl;
+        }
+        Cap(int water)
+        { 
+            water_ = water;
+            std::cout<<"construction with arg cap water : "<<water_<<std::endl;
+        }
+        virtual ~Cap()
+        { 
+            std::cout<<"destruction cap water : "<<water_<<std::endl;
+        }
+        Cap(const Cap& cap)
+        {
+            std::cout<<"construction copy, source cap water : "<<cap.water_<<std::endl;
+            water_ = cap.water_;
+        }
+        void set_water(int water){water_ = water;}
+        int water()
+        {
+            //std::cout<<"cap water : "<<water_<<std::endl;
+            return water_;
+        }
+    private:
+        int water_;
+};
+
+int main()
+{
+    std::cout<<"Step:1"<<std::endl;                                               
+    std::vector<Cap> box(3);                                                      
+    std::cout<<std::endl;                                                        
+    std::cout<<"Step:2"<<std::endl;                                               
+    std::vector<Cap> small_box;;                                                  
+    std::cout<<"small_box capacity: "<<small_box.capacity()<<std::endl;           
+    small_box.push_back(Cap(1));                                                  
+    std::cout<<"small_box capacity: "<<small_box.capacity()<<std::endl;           
+    small_box.push_back(Cap(2));                                                  
+    std::cout<<"small_box capacity: "<<small_box.capacity()<<std::endl;           
+    small_box.push_back(Cap(3));                                                  
+    std::cout<<"small_box capacity: "<<small_box.capacity()<<std::endl;         
+    std::cout<<std::endl;        
+    std::cout<<"Step:3"<<std::endl;  
+    std::cout<<"before reserve small_box capacity:"<<small_box.capacity()<<std::endl;
+    small_box.reserve(10);                                                         
+    std::cout<<"after reserve small_box capacity: "<<small_box.capacity()<<std::endl;
+    return 1; 
+}
+```
+
+上结果：
+
+```c++
+Step:1
+construction cap water : 0
+construction cap water : 0
+construction cap water : 0
+
+Step:2
+small_box capacity: 0
+construction with arg cap water : 1
+construction copy, source cap water : 1
+destruction cap water : 1
+small_box capacity: 1
+construction with arg cap water : 2
+construction copy, source cap water : 2
+construction copy, source cap water : 1
+destruction cap water : 1
+destruction cap water : 2
+small_box capacity: 2
+construction with arg cap water : 3
+construction copy, source cap water : 3
+construction copy, source cap water : 1
+construction copy, source cap water : 2
+destruction cap water : 1
+destruction cap water : 2
+destruction cap water : 3
+small_box capacity: 4
+
+Step:3
+before reserve small_box capacity: 4
+construction copy, source cap water : 1
+construction copy, source cap water : 2
+construction copy, source cap water : 3
+destruction cap water : 1
+destruction cap water : 2
+destruction cap water : 3
+after reserve small_box capacity: 10
+destruction cap water : 1
+destruction cap water : 2
+destruction cap water : 3
+destruction cap water : 0
+destruction cap water : 0
+destruction cap water : 0
+```
+
+第一步，vector构造时赋予一个容器大小，然后他就给你开辟了内存。开多大就掉多少次无参数的构造函数，把位置占了。也就是说，其实这个vector已经是满的了。这是合理的，毕竟你已经可以用下标直接访问这个vector了。
+
+第二步，一个vector初始化时没有给他一个大小，然后我们在插入的时观察他的大小变化。从一开始的0到1再到2再到4，vector容量的变化是按照2的指数来增长的，每次扩容，之前的对象全部都被拷贝一次。
+
+第三步，一个vector我们人工调用reverse来扩容时，和我们期待的一样：拷贝，但是他不会调用无参构造帮你占坑。结果中最后的三个析构0对应的是最开始那个vector。
+
+## 带auto的循环
+
+c++11带来了一个auto，自动推导类型，同时，还可以在一个for里面直接用auto，写起来很简单
+
+```c++
+vector<Cap> box;
+for(auto cap : box)
+{
+    ....
+}
+```
+
+看上去挺爽的，不过留坑了。这种访问方式是拷贝方式，也就是容器里面的元素被拷贝了一份给你看，所以如果你要想该表容器里面元素的值，得这样用：
+
+```c++
+vector<Cap> box;
+for(auto& cap : box)
+{
+    ....
+}
+```
+
+这个是和auto的推导规则挂钩的。还是自己太笨蛋了，这种还是那个原则，你在纠结他是拷贝还是引用的时候，那就是拷贝，别纠结了。
+
+## 未完
+
+还有些坑儿肯定也踩过，不过不一定记得了，未来想起来了继续更...

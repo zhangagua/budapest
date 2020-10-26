@@ -1,0 +1,63 @@
+---
+title: 基于机器码的数据库HyPer（一）（原理篇）
+date: 2016-06-21 03:41:10
+tags: 数据库
+categories: 数据库
+---
+
+
+在今天3月份投的paper审稿意见拿回来，我们一个组都懵了，那个时候才知道有个数据库叫Hyper，而且它的性能秒杀一众数据库。
+这里是官网：http://hyper-db.de/
+不得不的承认这个数据库的厉害的之处：**以LLVM为编译框架，将SQL直接解析为可执行机器码。**用当下流行的话来说就是，现在的数据库啊，一言不合就直接生成可执行二进制机器码。
+Hyper本来是单机的，有篇论文中似乎提到了将它简单分布式化的方法，而且，通过虚拟存储器快照的方式，实现了混合OLTP和OLAP。
+至少之前一直撸代码的我完全不知道居然可以直接从SQL生成可执行代码，内心一句感慨：“喔嘈，居然这么牛逼，得好好的看一下”。本来是被它的性能折服了，看到它居然引申出来发了数十篇paper以及真正的实现，真的感觉它是个黑科技啊。后来在了解一下，才知道Impala也是使用了这种方式的分布式数据库，之前也调研过Impala，但是不记得当时调研的童鞋是否提到这个东西了。然后我回头去翻了一下PPT，发现当时作报告的师兄确实木有关注到这个点哈。先科普什么一下，不然不清楚到底怎么会事儿。上英文。
+
+>used the Low Level Virtual Machine (LLVM) compiler framework to generate portable assembler code, which can then be executed directly using an optimizing JIT compiler provided by LLVM. 
+
+解释一下JIT，just in time compiler。
+>百度百科：即时编译器，JIT编译器能够将MSIL编译成为各种不同的机器代码，以适应对应的系统平台，最终使得程序在目标系统中得到顺利地运行。
+wiki：In computing, just-in-time (JIT) compilation, also known as dynamic translation, is compilation done during execution of a program – at run time – rather than prior to execution.[1] Most often this consists of translation to machine code, which is then executed directly, but can also refer to translation to another format.
+
+感觉wiki的解释更加严谨，百度百科有时候还是少了点严谨。也就是在运行的过程中编译出可执行代码，而不是像平时我们这样先编译再执行。按照常理来看，单关心执行时间，一边在编译一边在执行应该是慢于直接就开始执行已经编译好，为什么采用这样一边编译一边执行的方式居然还会得到性能的提升呢？
+
+这里我们就得贴一下HyPer发出来的Paper，[Efficiently Compiling Efficient Query Plans for Modern Hardware](http://www.vldb.org/pvldb/vol4/p539-neumann.pdf)。
+
+![Hyper_LLVM_C++](/images/hyper-llvm-c++.png)
+
+一串LLVM链条加上C++的三个轮子。
+
+原论文中这样说的：
+
+> First, an optimizing C++ compiler is really slow, compiling a complex query could take multiple seconds. 
+Second, C++ does not offer total control over the generated code, which can lead to suboptimal performance. 
+
+带有优化的C++编译器编译的很慢，同时C++生成代码并不是完全最优的，→_→。
+
+>Instead, we used the Low Level Virtual Machine (LLVM) compiler framework [7] to generate portable assembler code, which can then be executed directly using an optimizing JIT compiler provided by LLVM....(接下来列举LLVM的优点，编译的快，优化编译出来的机器码执行起来也很快 blabla)
+
+接着：
+
+>Still, one does not want to implement the complete query processing logic in LLVM assembler. 
+First, because writing assembler code is more tedious than using a high-level language like C++, and second, because much of the database logic like index structures is written in C++ anyway
+
+说白了就是设计复杂逻辑的部分使用c++来实现更有优势。
+
+接着就想把两者结合起来：
+
+>But one can easily mix LLVM and C++, as C++ methods can be called directly from LLVM and vice versa. 
+The different operators are connected together by LLVM code, which forms the chain in Figure 6. The C++ “cogwheels” are pre-compiled; only the LLVM “chain” for combining them is dynamically generated.
+
+这里说，按照混合的方式，齿轮c++的部分是实现就编译好的，然后链条LLVM是当即生成机器码来跑的。这个Figure6画的很有意思很形象，我们知道，整个动力驱动是来自于C++，因为它是动力齿轮，而我们运送东西还是承重也好，都是通过LLVM生成的代码来搞定的。也就是意味着，简单重复的劳动我们交给LLVM来搞定，程序的驱动还有带有逻辑判断或者复杂结构的部分呢，我们就交给我们的C++了。论文接着看，它是这么写的：
+
+>the complex part of the scan (e.g., locating data structures, figuring out what to scan next) is implemented in C++, and this C++ code “drives” the execution pipeline. But the tuple access itself and the further tuple processing (filtering, materialization in hash table) is implemented in LLVM assembler code. C++ code is called from time to time (like when allocating more memory), but interaction of the C++ parts is controlled by LLVM. If complex operators like sort are involved, control might go back fully into C++ at some point, but once the complex logic is
+over and tuples have to be processed in bulk, LLVM takes over again.
+
+和之前根据Figure6推测出来的差不多，讲到这里，确实就是比较清晰了，也就是说它还是在干我们前辈们干的事：简单粗暴重复量大的部分用汇编来实现，这样可以做到性能的极大优化。只不过汇编不再是人来写了，而且这个汇编不是写死的，而是通过JIT compiler动态生成的机器码来执行。这样搞，我觉得这样他的查询引擎复杂度真的很高。
+贴两个论文中测试数据的图：
+
+![hyper_oltp](/images/hyper-oltp.png)
+
+![hyper_olap](/images/hyper-olap.png)
+
+c++本身就是以性能著称的了，OLTP还可以理解，但是在OLAP这一块，这样的数量级差异真的太震撼了。不过仔细想想也是想的通的，毕竟OLTP没有大量重复的操作，而OLAP则是非常大的重复劳动，LLVM+JIT compiler的生成机器码的性能优势一下就体现出来了。这是第一篇论文，后面还会陆陆续续的看一下hyper的其他论文。
+
